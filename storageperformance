@@ -1,1 +1,383 @@
 https://blogs.technet.microsoft.com/xiangwu/2017/05/14/azure-vm-storage-performance-and-throttling-demystify/?ranMID=24542&ranEAID=je6NUbpObpQ&ranSiteID=je6NUbpObpQ-d2j3LUwNvKsZPcV0x9LSNg&epi=je6NUbpObpQ-d2j3LUwNvKsZPcV0x9LSNg&irgwc=1&OCID=AID2000142_aff_7593_1243925&tduid=(ir__tjs3n6it09kfryezkk0sohz30u2xgljntyxjxsw100)(7593)(1243925)(je6NUbpObpQ-d2j3LUwNvKsZPcV0x9LSNg)()&irclickid=_tjs3n6it09kfryezkk0sohz30u2xgljntyxjxsw100
+Azure VM Storage Performance and Throttling Demystified
+
+Today I want to discuss Azure Virtual Machine (VM) storage performance and throttling, especially as it relates to DS/GS series IaaS VM using Premium Storage. After three years, I now have the time to write my second blog post. I moved to the Microsoft Azure Rapid Response team last year and, on this new team, found that it's worth writing this blog as we have so many queries on storage performance in Azure IaaS VM. Customers often raise concerns on storage throttling and how the throttling negatively impacts production software and application performance such as SQL server. In writing this blog, I hope to reduce the case volume for storage performance issue and improve our customer's satisfaction.
+General Overview
+
+Storage performance issues are mainly due to blocking IOs, which means the application sends more IO than the storage can handle. This causes the IOs to be processed slower and some IOs are blocked until the previous IOs are processed
+
+The blocking IOs is not due to a physical limit, but rather is due to a software limit which we call "throttling". There are three places in an Azure VM where the IO can be blocked.
+
+    Disk Level IO throttling
+    VM Level Cached IO throttling
+    VM Level Uncached IO throttling
+
+The following diagram illustrates the general concept where the IOs are throttled.
+
+throttling
+
+As you can see from the above diagram, determining the disk level throttling can be complicated because the blocking can be either independent or dependent
+
+    Independent blocking -  the blocking issue is independent on different disks. A blocking issue on disk 1 won’t affect the performance on disk 2.
+    Dependent blocking - the blocking issue on disk 1 will hurt the performance on other disks, such as disk 2. VM level throttling is an example of dependent blocking.
+
+When there is no VM level throttling, then all disk level throttling issues are independent indicating that throttling on disk 1 won’t hurt the performance on disk 2. If disk 1 is throttled it means it’s fully utilized and additional disks may need to be added to the storage pool. To illustrate this, consider the following diagram where the VM is not throttled. The disk level throttling for disk 1 and disk 2 are independent of each other.
+
+pic-single-throttled
+
+When there is VM level throttling, disk 1 throttling with result in throttling on disk 2 regardless of the load on disk 2. You can see this in the diagram below.
+
+pic-both-throttled
+
+VM level throttling, cached or uncached, will cause dependent blocking issues. One or a few disks' throughput may trigger VM level throttling and make the rest of the disks slow. Consider a multiple thread application such as SQL server running on the VM where one thread performs too many writes to a data disk and blocks all the IOs on the rest of the disks. In this situation the SQL server has too much data to write in a short period of time to the data disk and that triggers the VM level throttling; therefore, the thread handles log will be extremely slow due to the LOG disk being blocked by the VM level throttling. This kind of scenario will cause slowness issues for all applications on the VM.
+
+Beside the multiple thread application scenario, a single thread application may have a different dependent blocking issue that is not VM level throttling. For example, consider a single thread application that has logic where it must finish writing the IOs to disk 1 before it will send IOs to disk 2. If disk 1 gets throttled, the application won’t be able to send the IO to disk 2 and disk 2 is blocked by disk 1 due to the application design. You may see warning or error messages from the application saying disk 2 IO is slow, but this is not the disk 2 issue. This would cause other applications on disk 1 to perform slowly, but applications running on disk 2 are unaffected.
+
+app
+
+ 
+
+In order to prevent the blocking issues and to improve the performance, we need to:
+
+    Prevent VM level throttling at all cost.
+    Prevent disk level throttling if the application has dependent blocking issue due to the software design. Adding more disks to create a storage pool may help.
+
+Best Practices to prevent VM level throttling
+
+Here are best practices recommendations on how to prevent the VM level throttling:
+Scenario 1: Temp disk is not required.
+
+When temp disk is not required, then the temp local disk should be disabled. The following conditions must be met by the other disks on the VM. Note: there is a link in the references that specifies the max limits for each VM size.
+
+    VM total cached disks throughput < VM cached max throughput limit
+    total (cached and uncached) disks throughput < VM uncached max throughput limit
+
+Scenario 2: Temp disk is required
+
+    If temp local disk is required, do not enable disk cache on mission critical disk to prevent disk performance issue due to machine level cached throttling, which is triggered by the excessive temp local disk usage. If you want to enable the cache on any of the data disks, bear in mind the disk might be extremely slow when there is a heavy IO issue on temp local disk. In the following test, it shows 0.11M/s throughput on a premium P30 disk for sync IO.
+    Total (cached and uncached, not include local temp disk) disk throughput < VM uncached max throughput
+
+If the disk throughput does not meet the application requirement, when adding more disks to create a storage pool, enlarge the VM size as well to make sure the point 1 and 2 are always true.
+
+** Microsoft released a new L series VM that doesn’t have cached IO limit, which says throughput only depends on VM size. It actually has limit similar to DS, but by default data disk cache is disabled and no UI to change it. The OS disk still have READ/WRITE cache enabled and will be throttled by the excessive local temp disk usage.
+Scenario 3: Large sized VM still has VM level throttling
+
+    If a big VM such as GS5 still has VM level throttling issue, you will need to move some of the workload to a different server.
+
+Best Practices to prevent disk level throttling
+
+In order to prevent disk level throttling, please adhere to the following best practices:
+
+    For temp local disk throttling, enlarge the VM size or consider using RAMDISK.
+        Linux has in RAM file system, which would be easy to use.
+        For Windows, a driver is required. WDK has a sample code https://github.com/Microsoft/Windows-driver-samples/tree/master/storage/ramdisk that you can build your own, or you can use a commercial one ( I choose two to compare in my test). It's hard to say which one is better, it all depends on your application IO pattern. You can stress test your application to see which one is better for your application.
+    For premium disk throttling, create a storage pool to contain more disks. Please be mindful not to trigger VM level throttling when you add more disks.
+
+In Detail
+
+First a disclaimer: I am NOT going to discuss the details on how and why the Azure Storage works this way. Please check the URLs in the end of this doc for more information or search on the web. I will only talk about the topics from the end users’ point of view - this includes using the storage testing tool "diskspd" to show test results and using basic storage concepts and calculation methods to internalize it. It will help us to have a better understanding of the following:
+
+    Storage Concept - the relationship between Azure IaaS Storage throttling and performance.
+    Choosing the right VM size and the Premium Storage.
+    Deeper understanding about performance and fine-tuning the application.
+
+Storage Concept
+
+Let's first talk about the relationship between throttling and the performance. In Azure, we have different levels of limits which may cause throttling, such as VM Level, Storage Account Level and Disk Level. A user application can send IO requests to the disk. The requests indeed will pass through the Host Machine. The disk IO requests will be translated to network packets and then sent to the backend storage stamp.
+
+Through this path, if the IOs hit any of the limits, then throttling will happen. Most Premium disk throttling happens on the host machine, regardless if it is VM level throttling or Disk level throttling. For Standard disk there is one additional storage account limit that may limit the IOPS. Standard disk throttling generally happens on the storage stamp. We won’t cover in detail the storage account level limit in this article.
+
+To understand the VM and storage limits, we need to have a basic understanding of storage performance. There are two types of IOs applications can use, async or sync. Since these types behave differently due to throttling it makes performance characteristics harder to understand. All throughput limits listed on the Azure VM size info page applies to both async IO or sync IO: https://docs.microsoft.com/en-us/azure/virtual-machines/virtual-machines-windows-sizes.
+
+For example, the Premium Disk P30 disk limit is 5000 IOPS and 200MB/s. This is the upper limit you can get for async IOs if you push enough IOs. For single thread sync IO, you will never get to this limit unless the sync IO uses multiple processes/threads that keep the outstanding IO or disk queue high. Most of the existing docs simply suggest adding more disks to improve the performance and we frequently see customers adding more disks; however, in this kind of sync IO situation, additional disks will not help. The truth is, for single thread sync IO, the max IO you can get is only related to the disk latency.
+
+To further demonstrate this, think about a situation where you have a team to help you send packages to your remote office. Each time you ask a team member to take a package from the main office, drive to the remote office, return to the main office, and then ask the second team member to do the same. If the round trip time is 10 minutes, then no matter how many employees you have, you can only send six packages per hour. This is how sync IO works.
+
+Therefore, to calculate the IOPs for Premium disk, we will simply need the disk latency. For Azure Premium disk the latency is around 2ms. In 1 second (1000 ms), you can get 1000ms/(2ms/IO) = 500 IOs. Since the limitation is on disk latency, you cannot improve this even if you add additional P30s. We see customers wasting money on the additional storage in hopes that there will be better performance on sync IO, but unfortunately it will not.
+
+Let's do a few more calculations:
+
+If you have 500 IOPS and the application IO size average is 4KB, then what you can get?
+
+       500IOPS x 4KB = 2000KB/s or around 2MB/s.
+
+How about if the IO size is 256KB?
+
+       500IOPS x 256KB = 128000KB/s = 125MB/s
+
+If you have a P30 and the latency consistently is 2ms, then how many outstanding IOs the application/applications should send to fully utilize the P30 disk?
+
+5000IOPs limit for p30 / 500IOPs per outstanding IO = 10 outstanding IO
+
+Yes, it is that simple. Now you have a basic idea on why some applications have poor performance even on Premium disk. It is because these applications can only send one outstanding sync IO at a given time.
+
+Let me make it a little bit more complicated to cover more concepts of disk queue length/outstanding IO, latency and IOPS, and their relationships. Regardless of whether you call it throttling in the cloud or limit/max throughput on-prem, you will find an interesting relationship between them.
+
+Let’s focus on a one disk scenario to make it easier to understand in this complicated scenario. We will use Azure Premium disk, P30 disk with 5000 IOPS max limit. As discussed earlier, one outstanding will get 500 IOPS and 10 outstanding will get 5000 IOPS. So what happens if I have 100 outstanding IOs when my application pushes very hard and how will throttling play a factor in this game? All we need is math to calculate this mystery:
+
+5000IOPS /100 outstanding = 50 IOPS
+
+which indicates that for each outstanding IO, the disk will allow 50 to go through per second. By having 100 outstanding, we have certainly hit the limit of the P30 disk. This will cause a latency which we can calculate using:
+
+Latency = 1000ms /50 IOPS = 20ms. The average latency will be 20ms.
+
+If the outstanding IO is 1000, then one P30 disk will have 200ms latency where each IO gets throttled 4 times (adding at 50ms per time). Therefore, if you are experiencing high latency, it’s likely because your application pushes too much IO traffic to the disk. If that is not the case then it might be machine level throttling (too much for the machine). Very rarely, it could be an Azure storage or network issue. Bandwidth or MBPS limit/throttling to latency calculation is more complicated, but the theory is similar. If your application pushes too much IO, you will get high latency. Carefully performing capacity planning and benchmark for each application is very important to avoid throttling problems in future.
+
+So is high outstanding IO/queue length good or bad? It all depends on how many IOs the disk can handle. For a P30, you will need at least 10 outstanding to fully utilize the disk. If you have 4 P30 storage pool, then you can have 40 outstanding IOs without causing the latency increase.
+How Azure throttles
+
+Now we move forward to talk about how Azure throttles. The SLA published for Premium disks is in IOPS, indicating IO per second. In actuality, we check the IOs throughput every 50ms instead of every 1s. In any given 50ms window, if the max limit is hit we will postpone all outstanding IOs to the next 50ms bucket which can mean a 50ms delay. Even worse, if the IOs get throttled multiple times then the latency will be compounded. For example, let's say all all your sync IOs get throttled and the average latency is 50ms, the disk will have 20 IOPS for sync IO. Yes, this is the number if you get throttled every time. In worst case, one IO might get throttled multiple times, and you won’t even get 20 IOPS. If the application only use 4KB per transfer/IO, then, in a production environment, it’s just too slow.
+
+For customers, it looks contradictory that the application only sends very few, less than 500 IOPS for sync IO, but still gets throttled and high latency? This is possible, as you now already know, it could be the machine level throttling, not on disk level. A good sample is if you push too many IOs to the local temp local disk and triggered the machine level cached throttling, the sync IO disk performance sucks on data or log disks with cache enabled. We will demo in the following tests.
+
+This is also the main reason why general practice for the storage design is to separate the async IO (DATABASE) and sync IO (LOG) to two different disks. You don't want the hard working async IO to cause throttling, high latency and impact the sync IO log disk IO.
+
+So there is a question, why applications use the "Performance Defect" sync IO?  The answer is simple, "Data Integrity". To ensure the "Data Integrity", the application has to sacrifice the "Performance".
+Real Tests (Tested in 2017)
+
+Let’s setup a test LAB and use the tests to see how IOs get throttled, to feel the real world and find a better way to prevent this from happening. I am going to create a DS13_V2 VM with four P30 disks, read/write cache enabled on the first two P30 disks, and uncached for the rest two to show you the real testing results. In the real world, the OS disk may also contribute and be affected by the throttling, but we won’t test in the LAB.
+
+ 
+
+DS13_V2 machine level limits, 256M (cached), 384M (uncached)
+
+1. Stress the temp local disk to check the throughput
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G d:\io.tst.bin
+
+D: = > Temp local disk reaches the machine cached limit 256M
+
+2. Stress the temp local disk and the data disks with cache enabled to check the throughput
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G d:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G e:\io.tst.bin
+
+D: => Temp local disk187M
+
+E: => Cached 70M
+
+Total around 256M, which is the machine cached limit
+
+3. Stress temp disk, P30 cached disk and P30 uncached disk to check the throughput
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G d:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G e:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G g:\io.tst.bin
+
+D: => Temp 171M
+
+E: => Cached disk 86M
+
+G: => Uuncached disk 194M
+
+Cached + Temp (257M) reaches the machine cached limit (256M)
+
+ Uncached reaches the disk limit
+
+384M > Premium Disks (Cached and Uncached) = 86+194 = 280. No uncached throttling.
+
+4. Sync IO simulation without VM level throttling
+
+diskspd –b4k -d30 -o1 -t1 -Sh -w100 -L -Z1G -c2G e:\io.tst.bin
+
+E: => 1.88M, IOPS = 481, Latency = 2.072ms
+
+5. Sync IO simulation when VM level throttling
+
+diskspd -b256k -d30 –o60 -t1 -Sh -w100 -L -Z1G -c2G d:\io.tst.bin
+
+diskspd –b4k -d30 -o1 -t1 -Sh -w100 -L -Z1G -c2G e:\io.tst.bin
+
+D: => Temp local disk 256M
+
+E: => Cached 0.11M, IOPS=27, Latency = 37ms
+
+E is very slow due to sync IO and 4K size during throttling on VM level.
+
+6. Cached and uncached disks without temp disk, total throughput is the uncached VM limit. Because, cached IO will end up the real “uncached” cache missed physical IO to the backend storage.
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G e:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G f:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G g:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G h:\io.tst.bin
+
+E: => cached 110M
+
+F: => cached 109M
+
+G: => uncached 80M
+
+H: => uncached 87M
+
+VM uncached limit 384M  (110+109+80+87 = 386)
+
+7. Latency and Queue Length relationship test
+
+diskspd -b4k -d30 -o100 -t1 -Sh -w100 -L -Z1G -c2G e:\io.tst.bin
+
+Queue Length 100, AvgLat = 19.6ms
+
+diskspd -b4k -d30 -o1000 -t1 -Sh -w100 -L -Z1G -c2G e:\io.tst.bin
+
+Queue Length 1000, AvgLat = 196ms
+
+Now we understand how to choose the VM size and the premium storage, I am repeating it
+Scenario 1: Temp disk is not required.
+
+When temp disk is not required, then the temp local disk should be disabled. The following conditions must be met by the other disks on the VM. Note: there is a link in the references that specifies the max limits for each VM size.
+
+    VM total cached disks throughput < VM cached max throughput limit
+    total (cached and uncached) disks throughput < VM uncached max throughput limit
+
+Scenario 2: Temp disk is required
+
+    If temp local disk is required, do not enable disk cache on mission critical disk to prevent disk performance issue due to machine level cached throttling, which is triggered by the excessive temp local disk usage. If you want to enable the cache on any of the data disks, bear in mind the disk might be useless when there is a heavy IO issue on temp local disk. In the following test, it shows 0.11M/s throughput on a premium P30 disk.
+    Total (cached and uncached, not include local temp disk) disk throughput < VM uncached max throughput
+
+Ideally, this is the max we can get which prevents the VM throttling.
+
+If the temp local disk is used, it pretty common to see it triggers machine level cached disk IO throttling. To prevent the negative impact on the disk when the VM level cached throttling, which may affect other disks, do not enable cache on other disks. Please remember to disable the cache on OS disk as well. P10 OS disk without cache might be slow, consider upgrade to P20 or P30.
+
+Let’s check a sample scenario. For example, a customer is using DS15_V2 with one P10 OS, four P30 cached as SQL DATA disk and two P30 uncached as LOG disk. Temp local disk is used.
+
+DS15_V2 Max throughput = 640M (Cached), 960M (Uncached)
+
+100M + 200Mx4 = 900M > 640M
+
+100M + 200Mx6 = 1300M > 960M
+
+This will easily trigger VM level throttling even the temp local disk is not used. The recommendation is to use no more than four P30.
+
+1. If cache is used, then do not use temp disk
+
+ (P10 OS disk + P30 Datax2 = 100M + 200Mx2 = 500M) < DS15_V2 cached 640M
+
+ (P10 OS disk + P30 Datax2 + P30 Logx2 = 100M + 200Mx2 + 200Mx2 = 900M) < DS15_V2 uncached 960M
+
+2. If cache is not used on all OS/DATA disks, temp local disk can be used.
+
+(P10 OS + P30 Data x 3 + P30 Log x 1 = 100M + 200Mx3 + 200M = 900M) < DS15_V2 960M
+
+General speaking, it’s very difficult to control the temp local disk throughput to prevent VM level cached IO throttling, so it’s recommended to leave all other disks cache disabled so that you can fully utilize the temp local disk while the cached throttling won’t affect the VM level uncached data disk performance.
+
+For VM throughput limit, if DS is not big enough, use GS/higher level VM.
+
+As we can see, even we tried our best to prevent throttling, the applications which use sync IO such as SQL may still have performance bottleneck, such as the 500 IOPS per sync IO due to latency. To fine-tune and to improve the performance
+
+    Redesign/fine-tune the application so that it can send bigger IO and multiple IOs at same time, so that it will help to minimize the IOPS performance issue due to the disk latency. For example, fine-tune the SQL write IO size and write IO pattern. For more information, please check the URL in the end of this article.
+    If you need a high performance temp disk, use RAMDISK, which will only have RAM/Driver physical limit and no throttling limit.
+
+Let’s see what you can get from RAMDISK. On DS13-V2, I have the following RAMDISK test rests. Please note use the third party software is on your own risk, I don’t endorse nor recommend any third party software in this test.
+
+Soft*******
+
+IOPS Test: diskspd –b4k -d30 -o1 -t1 -Sh –w100 -L -Z1G -c2G h:\io.tst.bin
+
+IOPS 283, 558, Latency 0.003ms
+
+Bandwidth Test: diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G h:\io.tst.bin
+
+Throughput 4236M/s
+
+Im****:
+
+IOPS Test: diskspd –b4k -d30 -o1 -t1 -Sh –w100 -L -Z1G -c2G h:\io.tst.bin
+
+IOPS 72,555, latency 0.013ms
+
+Bandwidth Test: diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G h:\io.tst.bin
+
+Throughput 8142M/S
+
+Both are faster than local temp drive and no machine level throttling issue.
+
+Finally, let’s go back to the A series and standard storage which doesn’t have machine level throttling, what we can get for the disk throttling and VM physical limitation. Just for reference.
+
+A4 Standard 16x500 IOPS, Attached 16x 500 IOPS, 60M standard disks.
+
+1. Local temp disk with 256K IO
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G d:\io.tst.bin
+
+D: => 15M
+
+2. One Data Disk
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G f:\io.tst.bin
+
+F: => 68M
+
+3. Sync IO, and the latency without heavy load
+
+diskspd -b4k -d30 -o1 -t1 -Sh -w100 -L -Z1G -c2G f:\io.tst.bin
+
+F: => 1.22M, IOPS 312 , Latency 3.2ms
+
+4. 16 Data Disks
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G f:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G g:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G h:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G i:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G j:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G k:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G l:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G m:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G n:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G o:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G p:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G q:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G r:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G s:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G t:\io.tst.bin
+
+diskspd -b256k -d30 -o10 -t1 -Sh -w100 -L -Z1G -c2G u:\io.tst.bin
+
+Total 529M, not as good as 16*60M = 960M, but also not too bad.
+
+Hope the information will be helpful for you to do the VM size and the storage planning in the future.
+More Information
+
+There are already few docs discuss the storage performance, such as
+
+1. Premium Storage Performance
+
+https://docs.microsoft.com/en-us/azure/storage/storage-scalability-targets
+
+https://azure.microsoft.com/en-us/blog/azure-premium-storage-now-generally-available-2/
+
+https://docs.microsoft.com/en-us/azure/storage/storage-premium-storage-performance
+
+2. Performance best practices for SQL Server
+
+https://docs.microsoft.com/en-us/azure/virtual-machines/windows/sql/virtual-machines-windows-sql-performance
+
+3. SQL Write IO size
+
+https://blogs.msdn.microsoft.com/sql_pfe_blog/2013/03/28/observing-sql-server-transaction-log-flush-sizes-using-extended-events-and-process-monitor/
+
+https://www.brentozar.com/archive/2012/05/how-big-your-log-writes-spying-on-sql-server-transaction-log/
+Additional Considerations
+
+    Antivirus program may affect the storage performance. Please exclude the SQL DB files, LOG files and other similar application files from real time monitoring.
+    ReFS, RAID5 or other similar storage technologies needs to compute and verify checksum. The overhead normally will make the latency sensitive applications perform badly.
